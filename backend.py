@@ -1,14 +1,98 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
+import time
+from functools import lru_cache
 from scipy.optimize import minimize
 
 
+@lru_cache(maxsize=128)
+def _download_single_yahoo_chart(ticker, period="3y", start_date=None, end_date=None):
+    """Lightweight Yahoo Chart API fallback for hosted environments."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "interval": "1d",
+        "events": "div,splits",
+        "includeAdjustedClose": "true",
+    }
+
+    if start_date is not None or end_date is not None:
+        start_ts = int(pd.Timestamp(start_date or "2023-01-01", tz="UTC").timestamp())
+        end_ts = int(
+            pd.Timestamp(end_date, tz="UTC").timestamp()
+            if end_date is not None
+            else pd.Timestamp.now(tz="UTC").timestamp()
+        )
+        params["period1"] = start_ts
+        params["period2"] = end_ts
+    else:
+        params["range"] = period or "3y"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=20)
+
+    if response.status_code == 429:
+        raise RuntimeError(f"Yahoo Finance rate-limited {ticker} (HTTP 429).")
+
+    response.raise_for_status()
+    payload = response.json()
+
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise RuntimeError(str(chart["error"]))
+
+    results = chart.get("result") or []
+    if not results:
+        return pd.Series(dtype=float, name=ticker)
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators", {})
+
+    adjclose_blocks = indicators.get("adjclose") or []
+    quote_blocks = indicators.get("quote") or []
+
+    values = None
+    if adjclose_blocks:
+        values = adjclose_blocks[0].get("adjclose")
+    if values is None and quote_blocks:
+        values = quote_blocks[0].get("close")
+
+    if not timestamps or values is None:
+        return pd.Series(dtype=float, name=ticker)
+
+    idx = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None)
+    series = pd.Series(values, index=idx, name=ticker, dtype="float64")
+    return series.dropna()
+
+
 def _download_close(tickers, start_date=None, end_date=None, period=None):
-    """Download adjusted closing prices from Yahoo Finance."""
+    """
+    Download adjusted closing prices with:
+    - batched yfinance request
+    - retries with backoff
+    - direct Yahoo Chart API fallback
+    - cached fallback responses
+    """
+    tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    if not tickers:
+        return pd.DataFrame()
+
     kwargs = {
         "auto_adjust": True,
         "progress": False,
+        "threads": False,
+        "timeout": 20,
     }
 
     if period is not None:
@@ -17,23 +101,79 @@ def _download_close(tickers, start_date=None, end_date=None, period=None):
         kwargs["start"] = start_date
         kwargs["end"] = end_date
 
-    data = yf.download(tickers, **kwargs)
+    partial = pd.DataFrame()
 
-    if data.empty:
-        return pd.DataFrame()
+    for attempt in range(3):
+        try:
+            data = yf.download(tickers, **kwargs)
 
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Close" not in data.columns.get_level_values(0):
-            return pd.DataFrame()
-        prices = data["Close"]
-    else:
-        if "Close" not in data.columns:
-            return pd.DataFrame()
-        prices = data[["Close"]]
+            if not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    prices = data["Close"] if "Close" in data.columns.get_level_values(0) else pd.DataFrame()
+                else:
+                    prices = data[["Close"]] if "Close" in data.columns else pd.DataFrame()
 
-    if isinstance(prices, pd.Series):
-        prices = prices.to_frame()
+                if isinstance(prices, pd.Series):
+                    prices = prices.to_frame()
 
+                if not prices.empty:
+                    if len(tickers) == 1 and len(prices.columns) == 1:
+                        prices.columns = [tickers[0]]
+
+                    got = {str(c).upper() for c in prices.columns}
+                    if all(t in got for t in tickers):
+                        return prices.sort_index()
+
+                    partial = prices.copy()
+        except Exception:
+            partial = pd.DataFrame()
+
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+
+    series_list = []
+
+    if not partial.empty:
+        for col in partial.columns:
+            s = partial[col].dropna().copy()
+            s.name = str(col).upper()
+            if not s.empty:
+                series_list.append(s)
+
+    existing = {s.name for s in series_list}
+    fallback_errors = []
+
+    for i, ticker in enumerate(tickers):
+        if ticker in existing:
+            continue
+
+        try:
+            s = _download_single_yahoo_chart(
+                ticker=ticker,
+                period=period or "3y",
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not s.empty:
+                series_list.append(s)
+            else:
+                fallback_errors.append(f"{ticker}: no price data")
+        except Exception as exc:
+            fallback_errors.append(f"{ticker}: {exc}")
+
+        if i < len(tickers) - 1:
+            time.sleep(0.35)
+
+    if not series_list:
+        details = "; ".join(fallback_errors[:5])
+        raise RuntimeError(
+            "Unable to download market data. Yahoo Finance is currently "
+            "rate-limiting the deployed server. "
+            + (f"Details: {details}" if details else "")
+        )
+
+    prices = pd.concat(series_list, axis=1).sort_index()
+    prices = prices.loc[:, ~prices.columns.duplicated()]
     return prices
 
 
